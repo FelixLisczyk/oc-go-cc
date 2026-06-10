@@ -315,7 +315,7 @@ func (h *MessagesHandler) handleStreaming(
 				if atomic.LoadInt32(&finished) == 1 {
 					return
 				}
-				_, _ = fmt.Fprintf(rw, ":keepalive\n\n")
+				_, _ = fmt.Fprintf(rw, "event: ping\ndata: {}\n\n")
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
 				}

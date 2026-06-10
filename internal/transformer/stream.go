@@ -30,15 +30,41 @@ func NewStreamHandler() *StreamHandler {
 	}
 }
 
+// SendMessageStart generates a message ID, writes the message_start SSE event,
+// and returns the ID so callers can pass it to ProxyStream to avoid a duplicate.
+func (h *StreamHandler) SendMessageStart(w http.ResponseWriter, model string) (string, error) {
+	msgID := "msg_" + generateID()
+	msgStart := types.MessageEvent{
+		Type: "message_start",
+		Message: &types.MessageResponse{
+			ID:      msgID,
+			Type:    "message",
+			Role:    "assistant",
+			Content: []types.ContentBlock{},
+			Model:   model,
+		},
+	}
+	if err := writeSSEEvent(w, msgStart); err != nil {
+		return "", ErrClientDisconnected
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return msgID, nil
+}
+
 // ProxyStream takes an OpenAI streaming response and writes Anthropic-format SSE to the writer.
 // It reads OpenAI ChatCompletionChunk SSE events and transforms them into Anthropic MessageEvent SSE events.
 // The clientCtx is used to detect client disconnection and abort early.
+//
+// If msgID is non-empty, the caller has already sent message_start and this function skips that step.
 //
 // CRITICAL: This function reads directly from resp.Body without buffering to minimize latency.
 // Per deep research: "Don't use bufio.Scanner or bufio.Reader on the response body - it adds buffering"
 func (h *StreamHandler) ProxyStream(
 	w http.ResponseWriter,
 	openaiResp io.ReadCloser,
+	msgID string,
 	originalModel string,
 	clientCtx context.Context,
 ) error {
@@ -47,24 +73,24 @@ func (h *StreamHandler) ProxyStream(
 		return fmt.Errorf("streaming not supported by response writer")
 	}
 
-	// Generate a unique message ID for this stream.
-	msgID := "msg_" + generateID()
-
-	// Send message_start event with the full message envelope.
-	msgStart := types.MessageEvent{
-		Type: "message_start",
-		Message: &types.MessageResponse{
-			ID:      msgID,
-			Type:    "message",
-			Role:    "assistant",
-			Content: []types.ContentBlock{},
-			Model:   originalModel,
-		},
+	// Send message_start only if the caller hasn't already done so.
+	if msgID == "" {
+		msgID = "msg_" + generateID()
+		msgStart := types.MessageEvent{
+			Type: "message_start",
+			Message: &types.MessageResponse{
+				ID:      msgID,
+				Type:    "message",
+				Role:    "assistant",
+				Content: []types.ContentBlock{},
+				Model:   originalModel,
+			},
+		}
+		if err := writeSSEEvent(w, msgStart); err != nil {
+			return ErrClientDisconnected
+		}
+		flusher.Flush()
 	}
-	if err := writeSSEEvent(w, msgStart); err != nil {
-		return ErrClientDisconnected
-	}
-	flusher.Flush()
 
 	// Read directly from response body without buffering.
 	// Use a tight loop with a line buffer - no bufio.Reader.
@@ -597,6 +623,7 @@ func generateID() string {
 func (h *StreamHandler) ProxyResponsesStream(
 	w http.ResponseWriter,
 	responsesResp io.ReadCloser,
+	msgID string,
 	originalModel string,
 	clientCtx context.Context,
 ) error {
@@ -605,19 +632,21 @@ func (h *StreamHandler) ProxyResponsesStream(
 		return fmt.Errorf("streaming not supported by response writer")
 	}
 
-	msgID := "msg_" + generateID()
-	msgStart := types.MessageEvent{
-		Type: "message_start",
-		Message: &types.MessageResponse{
-			ID:      msgID,
-			Type:    "message",
-			Role:    "assistant",
-			Content: []types.ContentBlock{},
-			Model:   originalModel,
-		},
-	}
-	if err := writeSSEEvent(w, msgStart); err != nil {
-		return ErrClientDisconnected
+	if msgID == "" {
+		msgID = "msg_" + generateID()
+		msgStart := types.MessageEvent{
+			Type: "message_start",
+			Message: &types.MessageResponse{
+				ID:      msgID,
+				Type:    "message",
+				Role:    "assistant",
+				Content: []types.ContentBlock{},
+				Model:   originalModel,
+			},
+		}
+		if err := writeSSEEvent(w, msgStart); err != nil {
+			return ErrClientDisconnected
+		}
 	}
 	flusher.Flush()
 
@@ -775,6 +804,7 @@ func (h *StreamHandler) processResponsesSSELine(
 func (h *StreamHandler) ProxyGeminiStream(
 	w http.ResponseWriter,
 	geminiResp io.ReadCloser,
+	msgID string,
 	originalModel string,
 	clientCtx context.Context,
 ) error {
@@ -783,19 +813,21 @@ func (h *StreamHandler) ProxyGeminiStream(
 		return fmt.Errorf("streaming not supported by response writer")
 	}
 
-	msgID := "msg_" + generateID()
-	msgStart := types.MessageEvent{
-		Type: "message_start",
-		Message: &types.MessageResponse{
-			ID:      msgID,
-			Type:    "message",
-			Role:    "assistant",
-			Content: []types.ContentBlock{},
-			Model:   originalModel,
-		},
-	}
-	if err := writeSSEEvent(w, msgStart); err != nil {
-		return ErrClientDisconnected
+	if msgID == "" {
+		msgID = "msg_" + generateID()
+		msgStart := types.MessageEvent{
+			Type: "message_start",
+			Message: &types.MessageResponse{
+				ID:      msgID,
+				Type:    "message",
+				Role:    "assistant",
+				Content: []types.ContentBlock{},
+				Model:   originalModel,
+			},
+		}
+		if err := writeSSEEvent(w, msgStart); err != nil {
+			return ErrClientDisconnected
+		}
 	}
 	flusher.Flush()
 

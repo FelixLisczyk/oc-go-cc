@@ -331,6 +331,19 @@ func (h *MessagesHandler) handleStreaming(
 		close(heartbeatDone)
 	}()
 
+	// Send message_start immediately so Claude Code sees the stream begin
+	// before we connect to upstream (which can take several seconds).
+	// Skip for Anthropic-native models — the upstream provides its own.
+	var msgID string
+	if len(modelChain) > 0 && !client.IsAnthropicModel(modelChain[0].ModelID) {
+		var err error
+		msgID, err = h.streamHandler.SendMessageStart(rw, modelChain[0].ModelID)
+		if err != nil {
+			h.logger.Info("client disconnected before stream started")
+			return
+		}
+	}
+
 	streamStart := time.Now()
 
 	for _, model := range modelChain {
@@ -370,7 +383,7 @@ func (h *MessagesHandler) handleStreaming(
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 
-			err := h.executeStreamingModel(ctx, rw, anthropicReq, model, rawBody, clientCtx)
+			err := h.executeStreamingModel(ctx, rw, anthropicReq, model, rawBody, clientCtx, msgID)
 			cancel()
 
 			if err == nil {
@@ -424,6 +437,9 @@ func (h *MessagesHandler) handleStreaming(
 // endpoint for a single model. It consolidates the Anthropic-native, Zen,
 // and OpenAI-compatible paths into a single method so the retry loop in
 // handleStreaming can call it uniformly.
+//
+// msgID is the pre-generated message ID from the early message_start event;
+// it is forwarded to the stream handler to avoid sending a duplicate.
 func (h *MessagesHandler) executeStreamingModel(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -431,20 +447,21 @@ func (h *MessagesHandler) executeStreamingModel(
 	model config.ModelConfig,
 	rawBody json.RawMessage,
 	clientCtx context.Context,
+	msgID string,
 ) error {
 	// Anthropic-native endpoint (MiniMax models on OpenCode Go)
 	if client.IsAnthropicModel(model.ModelID) {
 		modelBody := replaceModelInRawBody(rawBody, model.ModelID)
-		return h.handleAnthropicStreaming(ctx, w, modelBody, model.ModelID, model)
+		return h.handleAnthropicStreaming(ctx, w, modelBody, model.ModelID, model, msgID)
 	}
 
 	// Zen-specific endpoint handling (Anthropic, Responses, Gemini)
 	if client.IsZen(model) {
 		switch client.ClassifyEndpoint(model.ModelID) {
 		case client.EndpointResponses:
-			return h.handleResponsesStreaming(ctx, w, anthropicReq, model, clientCtx)
+			return h.handleResponsesStreaming(ctx, w, anthropicReq, model, clientCtx, msgID)
 		case client.EndpointGemini:
-			return h.handleGeminiStreaming(ctx, w, anthropicReq, model, clientCtx)
+			return h.handleGeminiStreaming(ctx, w, anthropicReq, model, clientCtx, msgID)
 		default:
 			// Fall through to OpenAI-compatible handling
 		}
@@ -462,7 +479,7 @@ func (h *MessagesHandler) executeStreamingModel(
 	}
 	defer func() { _ = streamBody.Close() }()
 
-	return h.streamHandler.ProxyStream(w, streamBody, model.ModelID, clientCtx)
+	return h.streamHandler.ProxyStream(w, streamBody, msgID, model.ModelID, clientCtx)
 }
 
 // isRetryableStreamingError returns true when an error from the upstream
@@ -503,6 +520,7 @@ func (h *MessagesHandler) handleResponsesStreaming(
 	anthropicReq *types.MessageRequest,
 	model config.ModelConfig,
 	clientCtx context.Context,
+	msgID string,
 ) error {
 	req, err := h.requestTransformer.TransformToResponses(anthropicReq, model)
 	if err != nil {
@@ -514,7 +532,7 @@ func (h *MessagesHandler) handleResponsesStreaming(
 		return err
 	}
 
-	if err := h.streamHandler.ProxyResponsesStream(w, streamBody, model.ModelID, clientCtx); err != nil {
+	if err := h.streamHandler.ProxyResponsesStream(w, streamBody, msgID, model.ModelID, clientCtx); err != nil {
 		_ = streamBody.Close()
 		return err
 	}
@@ -530,6 +548,7 @@ func (h *MessagesHandler) handleGeminiStreaming(
 	anthropicReq *types.MessageRequest,
 	model config.ModelConfig,
 	clientCtx context.Context,
+	msgID string,
 ) error {
 	req, err := h.requestTransformer.TransformToGemini(anthropicReq, model)
 	if err != nil {
@@ -541,7 +560,7 @@ func (h *MessagesHandler) handleGeminiStreaming(
 		return err
 	}
 
-	if err := h.streamHandler.ProxyGeminiStream(w, streamBody, model.ModelID, clientCtx); err != nil {
+	if err := h.streamHandler.ProxyGeminiStream(w, streamBody, msgID, model.ModelID, clientCtx); err != nil {
 		_ = streamBody.Close()
 		return err
 	}
@@ -573,12 +592,15 @@ func replaceModelInRawBody(rawBody json.RawMessage, modelID string) json.RawMess
 }
 
 // handleAnthropicStreaming sends a raw Anthropic request to the Anthropic endpoint.
+// The upstream response is native Anthropic SSE (already includes message_start),
+// so msgID is unused here but accepted for signature consistency.
 func (h *MessagesHandler) handleAnthropicStreaming(
 	ctx context.Context,
 	w http.ResponseWriter,
 	rawBody json.RawMessage,
 	modelID string,
 	model config.ModelConfig,
+	_ string, // msgID — unused, upstream provides its own message_start
 ) error {
 	h.logger.Debug("sending anthropic streaming request",
 		"model_id", modelID,

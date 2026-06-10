@@ -22,6 +22,14 @@ import (
 	"oc-go-cc/pkg/types"
 )
 
+const (
+	// maxStreamingRetries is the number of times to retry a single model for
+	// streaming requests before moving to the next model in the fallback chain.
+	maxStreamingRetries = 3
+	// maxRetryBackoff is the maximum backoff duration between retries.
+	maxRetryBackoff = 10 * time.Second
+)
+
 // MessagesHandler handles /v1/messages requests.
 type MessagesHandler struct {
 	client              *client.OpenCodeClient
@@ -333,110 +341,75 @@ func (h *MessagesHandler) handleStreaming(
 		default:
 		}
 
-		h.logger.Info("attempting streaming model", "model", model.ModelID, "provider", model.Provider)
-
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-
-		// Check if this is an Anthropic-native model (MiniMax)
-		if client.IsAnthropicModel(model.ModelID) {
-			modelBody := replaceModelInRawBody(rawBody, model.ModelID)
-			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID, model); err != nil {
-				cancel()
-				if clientCtx.Err() == context.Canceled {
-					h.logger.Info("client disconnected during anthropic stream")
+		// Retry the same model a few times on transient upstream errors
+		// before moving to the next model in the fallback chain.
+		for attempt := 0; attempt < maxStreamingRetries; attempt++ {
+			if attempt > 0 {
+				backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+				if backoff > maxRetryBackoff {
+					backoff = maxRetryBackoff
+				}
+				h.logger.Info("retrying streaming model",
+					"model", model.ModelID,
+					"attempt", attempt+1,
+					"backoff", backoff,
+				)
+				select {
+				case <-time.After(backoff):
+				case <-clientCtx.Done():
+					h.logger.Info("client disconnected during retry backoff")
 					return
 				}
-				h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
-				continue
 			}
-			cancel()
-			latency := time.Since(streamStart)
-			h.metrics.RecordSuccess(model.ModelID, latency)
-			h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
-			return
-		}
 
-		// Zen-specific endpoint handling
-		if client.IsZen(model) {
-			endpointType := client.ClassifyEndpoint(model.ModelID)
-			switch endpointType {
-			case client.EndpointResponses:
-				if err := h.handleResponsesStreaming(ctx, rw, anthropicReq, model, clientCtx); err != nil {
-					cancel()
-					if clientCtx.Err() == context.Canceled {
-						h.logger.Info("client disconnected during responses stream")
-						return
-					}
-					h.logger.Warn("responses streaming failed", "model", model.ModelID, "error", err)
-					continue
-				}
-				cancel()
+			h.logger.Info("attempting streaming model",
+				"model", model.ModelID,
+				"provider", model.Provider,
+				"attempt", attempt+1,
+			)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+
+			err := h.executeStreamingModel(ctx, rw, anthropicReq, model, rawBody, clientCtx)
+			cancel()
+
+			if err == nil {
 				latency := time.Since(streamStart)
 				h.metrics.RecordSuccess(model.ModelID, latency)
-				h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
+				h.logger.Info("streaming completed",
+					"model", model.ModelID,
+					"latency", latency,
+					"attempts", attempt+1,
+				)
 				return
-
-			case client.EndpointGemini:
-				if err := h.handleGeminiStreaming(ctx, rw, anthropicReq, model, clientCtx); err != nil {
-					cancel()
-					if clientCtx.Err() == context.Canceled {
-						h.logger.Info("client disconnected during gemini stream")
-						return
-					}
-					h.logger.Warn("gemini streaming failed", "model", model.ModelID, "error", err)
-					continue
-				}
-				cancel()
-				latency := time.Since(streamStart)
-				h.metrics.RecordSuccess(model.ModelID, latency)
-				h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
-				return
-
-			default:
-				// Fall through to OpenAI-compatible handling
 			}
-		}
 
-		// OpenAI-compatible models (both Go and Zen)
-		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
-		if err != nil {
-			cancel()
-			h.logger.Warn("request transform failed", "model", model.ModelID, "error", err)
-			continue
-		}
-
-		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq, model)
-		if err != nil {
-			cancel()
+			// Client disconnected — stop entirely, not retryable.
 			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during upstream request")
+				h.logger.Info("client disconnected during stream")
 				return
 			}
-			h.logger.Warn("streaming request failed", "model", model.ModelID, "error", err)
-			continue
-		}
-
-		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx); err != nil {
-			_ = streamBody.Close()
-			cancel()
 			if err == transformer.ErrClientDisconnected {
 				h.logger.Info("client disconnected during stream")
 				return
 			}
-			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during stream (context canceled)")
-				return
-			}
-			h.logger.Warn("stream proxy failed", "model", model.ModelID, "error", err)
-			continue
-		}
 
-		_ = streamBody.Close()
-		cancel()
-		latency := time.Since(streamStart)
-		h.metrics.RecordSuccess(model.ModelID, latency)
-		h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
-		return
+			// Non-retryable errors: don't retry, skip straight to fallback.
+			if !isRetryableStreamingError(err) {
+				h.logger.Warn("non-retryable streaming error",
+					"model", model.ModelID,
+					"error", err,
+				)
+				break
+			}
+
+			h.logger.Warn("streaming model failed, will retry",
+				"model", model.ModelID,
+				"error", err,
+				"attempt", attempt+1,
+				"max_retries", maxStreamingRetries,
+			)
+		}
 	}
 
 	h.metrics.RecordFailure()
@@ -445,6 +418,82 @@ func (h *MessagesHandler) handleStreaming(
 	} else {
 		h.sendStreamError(rw, "all upstream models failed")
 	}
+}
+
+// executeStreamingModel dispatches a streaming request to the appropriate
+// endpoint for a single model. It consolidates the Anthropic-native, Zen,
+// and OpenAI-compatible paths into a single method so the retry loop in
+// handleStreaming can call it uniformly.
+func (h *MessagesHandler) executeStreamingModel(
+	ctx context.Context,
+	w http.ResponseWriter,
+	anthropicReq *types.MessageRequest,
+	model config.ModelConfig,
+	rawBody json.RawMessage,
+	clientCtx context.Context,
+) error {
+	// Anthropic-native endpoint (MiniMax models on OpenCode Go)
+	if client.IsAnthropicModel(model.ModelID) {
+		modelBody := replaceModelInRawBody(rawBody, model.ModelID)
+		return h.handleAnthropicStreaming(ctx, w, modelBody, model.ModelID, model)
+	}
+
+	// Zen-specific endpoint handling (Anthropic, Responses, Gemini)
+	if client.IsZen(model) {
+		switch client.ClassifyEndpoint(model.ModelID) {
+		case client.EndpointResponses:
+			return h.handleResponsesStreaming(ctx, w, anthropicReq, model, clientCtx)
+		case client.EndpointGemini:
+			return h.handleGeminiStreaming(ctx, w, anthropicReq, model, clientCtx)
+		default:
+			// Fall through to OpenAI-compatible handling
+		}
+	}
+
+	// OpenAI-compatible path (both OpenCode Go and Zen)
+	openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
+	if err != nil {
+		return fmt.Errorf("request transform failed: %w", err)
+	}
+
+	streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq, model)
+	if err != nil {
+		return fmt.Errorf("streaming request failed: %w", err)
+	}
+	defer func() { _ = streamBody.Close() }()
+
+	return h.streamHandler.ProxyStream(w, streamBody, model.ModelID, clientCtx)
+}
+
+// isRetryableStreamingError returns true when an error from the upstream
+// streaming request is likely transient and worth retrying with backoff.
+// Client disconnects and context cancellations are handled separately by
+// the caller before this check runs.
+func isRetryableStreamingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	retryable := []string{
+		"broken pipe",
+		"connection refused",
+		"connection reset",
+		"context deadline exceeded",
+		"EOF",
+		"rate limit",
+		"request failed",
+		"timeout",
+		"429",
+		"500",
+		"502",
+		"503",
+	}
+	for _, sub := range retryable {
+		if strings.Contains(errStr, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // handleResponsesStreaming handles streaming for OpenAI Responses endpoint.

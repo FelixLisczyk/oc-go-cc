@@ -449,15 +449,12 @@ func (h *MessagesHandler) executeStreamingModel(
 	clientCtx context.Context,
 	msgID string,
 ) error {
-	// Anthropic-native endpoint (MiniMax models on OpenCode Go)
-	if client.IsAnthropicModel(model.ModelID) {
-		modelBody := replaceModelInRawBody(rawBody, model.ModelID)
-		return h.handleAnthropicStreaming(ctx, w, modelBody, model.ModelID, model, msgID)
-	}
-
-	// Zen-specific endpoint handling (Anthropic, Responses, Gemini)
+	// Zen models use their own endpoint classification
 	if client.IsZen(model) {
 		switch client.ClassifyEndpoint(model.ModelID) {
+		case client.EndpointAnthropic:
+			modelBody := replaceModelInRawBody(rawBody, model.ModelID)
+			return h.handleAnthropicStreaming(ctx, w, modelBody, model.ModelID, model, msgID)
 		case client.EndpointResponses:
 			return h.handleResponsesStreaming(ctx, w, anthropicReq, model, clientCtx, msgID)
 		case client.EndpointGemini:
@@ -569,6 +566,7 @@ func (h *MessagesHandler) handleGeminiStreaming(
 	return nil
 }
 
+// replaceModelInRawBody
 // replaceModelInRawBody replaces the model field in raw JSON body with the actual model ID.
 func replaceModelInRawBody(rawBody json.RawMessage, modelID string) json.RawMessage {
 	bodyStr := string(rawBody)
@@ -592,8 +590,6 @@ func replaceModelInRawBody(rawBody json.RawMessage, modelID string) json.RawMess
 }
 
 // handleAnthropicStreaming sends a raw Anthropic request to the Anthropic endpoint.
-// The upstream response is native Anthropic SSE (already includes message_start),
-// so msgID is unused here but accepted for signature consistency.
 func (h *MessagesHandler) handleAnthropicStreaming(
 	ctx context.Context,
 	w http.ResponseWriter,
@@ -658,15 +654,12 @@ func (h *MessagesHandler) handleNonStreaming(
 		ctx,
 		modelChain,
 		func(ctx context.Context, model config.ModelConfig) ([]byte, error) {
-			// Check if this is an Anthropic-native model (MiniMax)
-			if client.IsAnthropicModel(model.ModelID) {
-				return h.executeAnthropicRequest(ctx, rawBody, model)
-			}
-
-			// Zen-specific endpoint handling
+			// Zen models use their own endpoint classification
 			if client.IsZen(model) {
 				endpointType := client.ClassifyEndpoint(model.ModelID)
 				switch endpointType {
+				case client.EndpointAnthropic:
+					return h.executeAnthropicRequest(ctx, rawBody, model)
 				case client.EndpointResponses:
 					return h.executeResponsesRequest(ctx, anthropicReq, model)
 				case client.EndpointGemini:
@@ -674,6 +667,9 @@ func (h *MessagesHandler) handleNonStreaming(
 				default:
 					// Fall through to OpenAI-compatible handling
 				}
+			} else if client.IsAnthropicModel(model.ModelID) {
+				// Go provider Anthropic-native models (MiniMax, Qwen)
+				return h.executeAnthropicRequest(ctx, rawBody, model)
 			}
 
 			// OpenAI-compatible models (both Go and Zen)
